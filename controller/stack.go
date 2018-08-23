@@ -20,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 )
@@ -190,10 +189,15 @@ func (c *StackController) manageDeployment(stack zv1.Stack, traffic map[string]T
 				Name:        stack.Name,
 				Namespace:   stack.Namespace,
 				Annotations: map[string]string{},
-				// add custom label owner reference since we can't use Kubernetes
-				// OwnerReferences as this would trigger a deletion of the Deployment
-				// as soon as the Stack is deleted.
-				Labels: map[string]string{stacksetStackOwnerReferenceLabelKey: string(stack.UID)},
+				Labels:      map[string]string{},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: stack.APIVersion,
+						Kind:       stack.Kind,
+						Name:       stack.Name,
+						UID:        stack.UID,
+					},
+				},
 			},
 			Spec: appsv1.DeploymentSpec{
 				Selector: &metav1.LabelSelector{
@@ -224,13 +228,6 @@ func (c *StackController) manageDeployment(stack zv1.Stack, traffic map[string]T
 	}
 
 	if traffic != nil && traffic[stack.Name].Weight() <= 0 {
-
-		// if the stack is being terminated and the stack isn't getting
-		// traffic. Then there's no need to create a deployment.
-		if createDeployment && stack.DeletionTimestamp != nil {
-			return nil
-		}
-
 		if ttl, ok := deployment.Annotations[noTrafficSinceAnnotationKey]; ok {
 			noTrafficSince, err := time.Parse(time.RFC3339, ttl)
 			if err != nil {
@@ -243,24 +240,22 @@ func (c *StackController) manageDeployment(stack zv1.Stack, traffic map[string]T
 				deployment.Spec.Replicas = &replicas
 			}
 
-			if stack.DeletionTimestamp != nil && stack.DeletionTimestamp.Time.Before(time.Now().UTC()) {
-				if !noTrafficSince.IsZero() && time.Since(noTrafficSince) > c.noTrafficTerminationTTL {
-					// delete deployment
-					if !createDeployment {
-						c.logger.Infof("Deleting Deployment %s/%s no longer needed", deployment.Namespace, deployment.Name)
-						err = c.kube.AppsV1().Deployments(deployment.Namespace).Delete(deployment.Name, nil)
-						if err != nil {
-							return fmt.Errorf(
-								"failed to delete Deployment %s/%s owned by Stack %s/%s",
-								deployment.Namespace,
-								deployment.Name,
-								stack.Namespace,
-								stack.Name,
-							)
-						}
+			if !noTrafficSince.IsZero() && time.Since(noTrafficSince) > c.noTrafficTerminationTTL {
+				// delete deployment
+				if !createDeployment {
+					c.logger.Infof("Deleting Deployment %s/%s no longer needed", deployment.Namespace, deployment.Name)
+					err = c.kube.AppsV1().Deployments(deployment.Namespace).Delete(deployment.Name, nil)
+					if err != nil {
+						return fmt.Errorf(
+							"failed to delete Deployment %s/%s owned by Stack %s/%s",
+							deployment.Namespace,
+							deployment.Name,
+							stack.Namespace,
+							stack.Name,
+						)
 					}
-					return nil
 				}
+				return nil
 			}
 		} else {
 			deployment.Annotations[noTrafficSinceAnnotationKey] = time.Now().UTC().Format(time.RFC3339)
@@ -273,8 +268,7 @@ func (c *StackController) manageDeployment(stack zv1.Stack, traffic map[string]T
 		}
 	}
 
-	// create deployment if stack is not terminating.
-	if createDeployment && stack.DeletionTimestamp == nil {
+	if createDeployment {
 		c.logger.Infof(
 			"Creating Deployment %s/%s for StackSet stack %s/%s",
 			deployment.Namespace,
@@ -565,7 +559,7 @@ func getDeployment(kube kubernetes.Interface, stack zv1.Stack) (*appsv1.Deployme
 	}
 
 	// check if object is owned by the stack resource
-	if uid, ok := deployment.Labels[stacksetStackOwnerReferenceLabelKey]; !ok || types.UID(uid) != stack.UID {
+	if !isOwnedReference(stack.TypeMeta, stack.ObjectMeta, deployment.ObjectMeta) {
 		return nil, fmt.Errorf(
 			"found Deployment '%s/%s' not managed by the StackSet stack %s/%s",
 			deployment.Namespace,

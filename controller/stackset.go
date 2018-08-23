@@ -15,7 +15,6 @@ import (
 	zv1 "github.com/zalando-incubator/stackset-controller/pkg/apis/zalando/v1"
 	clientset "github.com/zalando-incubator/stackset-controller/pkg/client/clientset/versioned"
 	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -31,9 +30,6 @@ const (
 	stackVersionLabelKey                      = "stack-version"
 	defaultVersion                            = "default"
 	defaultStackLifecycleLimit                = 10
-	stacksetStackFinalizer                    = "finalizer.stacks.zalando.org"
-	stacksetFinalizer                         = "finalizer.stacksets.zalando.org" // TODO: implement this
-	stacksetStackOwnerReferenceLabelKey       = "stackset-stack-owner-reference"
 	stacksetControllerControllerAnnotationKey = "stackset-controller.zalando.org/controller"
 )
 
@@ -382,65 +378,6 @@ func (c *StackSetController) gcStacks(stackset zv1.StackSet) error {
 
 	gcCandidates := make([]zv1.Stack, 0, len(stacks.Items))
 	for _, stack := range stacks.Items {
-		// handle Stacks terminating
-		if stack.DeletionTimestamp != nil && stack.DeletionTimestamp.Time.Before(time.Now().UTC()) && strInSlice(stacksetStackFinalizer, stack.Finalizers) {
-			c.logger.Infof(
-				"Stack %s/%s has been marked for termination. Checking if it's safe to remove it",
-				stack.Namespace,
-				stack.Name,
-			)
-
-			if traffic != nil && traffic[stack.Name].Weight() > 0 {
-				c.logger.Warnf(
-					"Unable to delete terminating Stack '%s/%s'. Still getting %.1f%% traffic",
-					stack.Namespace,
-					stack.Name,
-					traffic[stack.Name],
-				)
-				continue
-			}
-
-			deployment, err := getDeployment(c.kube, stack)
-			if err != nil {
-				if !errors.IsNotFound(err) {
-					return err
-				}
-			}
-
-			// if deployment doesn't exist or has no replicas then
-			// it's safe to delete the stack.
-			if deployment == nil || deployment.Spec.Replicas == nil || *deployment.Spec.Replicas == 0 {
-				finalizers := []string{}
-				for _, finalizer := range stack.Finalizers {
-					if finalizer != stacksetStackFinalizer {
-						finalizers = append(finalizers, finalizer)
-					}
-				}
-
-				stack.Finalizers = finalizers
-
-				c.logger.Infof("Removing Finalizer '%s' from Stack %s/%s", stacksetStackFinalizer, stack.Namespace, stack.Name)
-				_, err = c.appClient.ZalandoV1().Stacks(stack.Namespace).Update(&stack)
-				if err != nil {
-					return fmt.Errorf(
-						"failed to update Stack %s/%s: %v",
-						stack.Namespace,
-						stack.Name,
-						err,
-					)
-				}
-				continue
-			}
-
-			c.logger.Warnf(
-				"Unable to delete terminating Stack '%s/%s'. Deployment still has %d replica(s)",
-				stack.Namespace,
-				stack.Name,
-				*deployment.Spec.Replicas,
-			)
-			continue
-		}
-
 		// never garbage collect stacks with traffic
 		if traffic != nil && traffic[stack.Name].Weight() > 0 {
 			continue
@@ -550,7 +487,6 @@ func (c *StackSetController) manageStackSet(stackset *zv1.StackSet) error {
 						UID:        stackset.UID,
 					},
 				},
-				Finalizers: []string{stacksetStackFinalizer},
 			},
 		}
 	}
